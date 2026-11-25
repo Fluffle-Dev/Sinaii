@@ -1,34 +1,34 @@
-name: Render Faith Route Video (1080p)
+name: Render Faith Route Video (1080p Parallel)
 
 on:
   workflow_dispatch:
 
 jobs:
-  render-video:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 30
+    outputs:
+      total_frames: ${{ steps.calc.outputs.total_frames }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install FFmpeg & Chrome Libraries
+      - name: Install FFmpeg & Whisper
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg wget
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb
-          rm -f google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y -qq ffmpeg
+          pip install -q faster-whisper scipy numpy
 
       - name: Unpack Project ZIP & Locate Audio
         run: |
@@ -44,10 +44,10 @@ jobs:
               with zipfile.ZipFile(chosen, 'r') as z:
                   z.extractall('.')
 
-          assert os.path.isdir('faith-route-studio'), 'faith-route-studio folder missing after extract!'
+          assert os.path.isdir('faith-route-studio'), 'faith-route-studio folder missing!'
 
           mp3s = sorted(glob.glob('*.mp3') + glob.glob('faith-route-studio/*.mp3'))
-          assert mp3s, 'No .mp3 voiceover file found in repo root!'
+          assert mp3s, 'No .mp3 voiceover file found!'
           voice_mp3 = None
           ambient_mp3 = None
           for f in mp3s:
@@ -64,41 +64,171 @@ jobs:
               print(f'Ambient music: {ambient_mp3}')
           EOF
 
-      - name: Setup Faith Route Studio (NPM, Fonts & Whisper)
-        working-directory: faith-route-studio
-        run: bash tools/setup.sh
-
-      - name: Build Voice WAV, Transcribe & Align Word Timestamps
+      - name: Build Voice WAV, Transcribe & Align
+        id: calc
         working-directory: faith-route-studio
         run: |
           bash tools/voice.sh voice_input.mp3
           python3 tools/tr.py
           python3 tools/align.py
           python3 tools/chk.py app/src/scenes/ay1.tsx app/src/scenes/ay2.tsx
+          T=$(node -e "const w=require('./app/src/words.json');console.log(Math.ceil((w[w.length-1].e+2.4)*30))")
+          echo "total_frames=$T" >> "$GITHUB_OUTPUT"
+          echo "Total frames to render: $T"
+          mkdir -p ../prep_out
+          cp app/src/words.json ../prep_out/words.json
+          cp app/public/voice.wav ../prep_out/voice.wav
+          [ -f ambient_input.mp3 ] && cp ambient_input.mp3 ../prep_out/ambient_input.mp3 || true
 
-      - name: Render 1080p Video Chunks (4 Cores)
-        working-directory: faith-route-studio
-        run: |
-          CONCURRENCY=$(nproc) bash tools/render.sh
+      - name: Upload Prepared Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-assets
+          path: prep_out
+          retention-days: 1
 
-      - name: Assemble, Master Audio (-14 LUFS) & Render Thumbnail
-        working-directory: faith-route-studio
+  render-chunk:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Chrome Libraries & FFmpeg
         run: |
-          bash tools/final.sh raw_muxed.mp4
-          OUT="The_Question_God_Keeps_Asking_MASTER.mp4"
-          if [ -f "ambient_input.mp3" ]; then
-            ffmpeg -loglevel error -y -i raw_muxed.mp4 -stream_loop -1 -i ambient_input.mp3 -filter_complex "[1:a]volume=0.11[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3,loudnorm=I=-14:TP=-1.5:LRA=11[aout]" -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 256k "$OUT"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg wget
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
+
+      - name: Unpack Project ZIP
+        run: |
+          python3 - << 'EOF'
+          import os, glob, zipfile
+          if not os.path.isdir('faith-route-studio'):
+              zips = sorted(glob.glob('*.zip'))
+              pref = [z for z in zips if 'where_are_you' in z.lower() or 'complete' in z.lower()]
+              chosen = pref[-1] if pref else zips[-1]
+              with zipfile.ZipFile(chosen, 'r') as z:
+                  z.extractall('.')
+          EOF
+
+      - name: Download Prepared Timestamps & Audio
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-assets
+          path: prep_out
+
+      - name: Install NPM Dependencies & Fonts
+        working-directory: faith-route-studio/app
+        run: |
+          cp ../../prep_out/words.json src/words.json
+          mkdir -p public/fonts
+          cp ../../prep_out/voice.wav public/voice.wav
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          for f in cinzel/files/cinzel-latin-500-normal.woff2 cinzel/files/cinzel-latin-700-normal.woff2 cormorant-garamond/files/cormorant-garamond-latin-500-italic.woff2 noto-serif-hebrew/files/noto-serif-hebrew-hebrew-500-normal.woff2 noto-serif/files/noto-serif-greek-500-normal.woff2 noto-serif/files/noto-serif-greek-400-italic.woff2; do cp node_modules/@fontsource/$f public/fonts/; done
+
+      - name: Render Assigned Frame Chunk
+        working-directory: faith-route-studio/app
+        run: |
+          mkdir -p ../chunks
+          TOTAL=${{ needs.prepare.outputs.total_frames }}
+          PARTS=10
+          IDX=${{ matrix.chunk }}
+          START=$(( IDX * TOTAL / PARTS ))
+          END=$(( (IDX + 1) * TOTAL / PARTS - 1 ))
+          PAD=$(printf "%02d" $IDX)
+          CONC=$(nproc)
+          echo "Chunk $PAD: rendering frames $START-$END of $TOTAL on $CONC cores..."
+          npx remotion render src/index.ts Main ../chunks/c${PAD}.mp4 \
+            --frames=${START}-${END} \
+            --muted \
+            --codec=h264 \
+            --crf=16 \
+            --x264-preset=veryfast \
+            --pixel-format=yuv420p \
+            --image-format=jpeg \
+            --jpeg-quality=88 \
+            --concurrency=${CONC} \
+            --gl=swangle
+
+      - name: Render Thumbnail (Chunk 0 Only)
+        if: matrix.chunk == 0
+        working-directory: faith-route-studio/app
+        run: |
+          npx remotion still src/index.ts Thumb ../chunks/thumb_raw.png --props='{"v":1}' --gl=swangle
+          ffmpeg -loglevel error -y -i ../chunks/thumb_raw.png -vf scale=1280:720 -q:v 2 ../chunks/thumbnail_where_are_you.jpg
+          rm -f ../chunks/thumb_raw.png
+
+      - name: Upload Rendered Chunk
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}
+          path: faith-route-studio/chunks/*
+          retention-days: 1
+
+  assemble:
+    needs: [prepare, render-chunk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Download All Chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          merge-multiple: true
+          path: chunks
+
+      - name: Download Audio Assets
+        uses: actions/download-artifact@v4
+        with:
+          name: prepared-assets
+          path: prep_out
+
+      - name: Stitch Chunks & Master Audio (-14 LUFS)
+        run: |
+          mkdir -p final_out
+          cd chunks
+          : > list.txt
+          for c in $(ls c[0-9][0-9].mp4 | sort); do
+            echo "file '$PWD/$c'" >> list.txt
+          done
+          ffmpeg -loglevel error -y -f concat -safe 0 -i list.txt -c copy video_only.mp4
+          cd ..
+          OUT="final_out/The_Question_God_Keeps_Asking_MASTER.mp4"
+          if [ -f "prep_out/ambient_input.mp3" ]; then
+            ffmpeg -loglevel error -y -i chunks/video_only.mp4 -i prep_out/voice.wav -stream_loop -1 -i prep_out/ambient_input.mp3 \
+              -filter_complex "[2:a]volume=0.11[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=3,loudnorm=I=-14:TP=-1.5:LRA=11[aout]" \
+              -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 256k -shortest "$OUT"
           else
-            ffmpeg -loglevel error -y -i raw_muxed.mp4 -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v copy -c:a aac -b:a 256k "$OUT"
+            ffmpeg -loglevel error -y -i chunks/video_only.mp4 -i prep_out/voice.wav \
+              -map 0:v -map 1:a -af "loudnorm=I=-14:TP=-1.5:LRA=11" \
+              -c:v copy -c:a aac -b:a 256k "$OUT"
           fi
-          bash tools/thumb.sh 1 thumbnail_where_are_you.jpg
-          ls -lh "$OUT" thumbnail_where_are_you.jpg
+          cp chunks/thumbnail_where_are_you.jpg final_out/thumbnail_where_are_you.jpg
+          ls -lh final_out/
 
-      - name: Upload Mastered MP4 & Thumbnail Artifacts
+      - name: Upload Mastered MP4 & Thumbnail
         uses: actions/upload-artifact@v4
         with:
           name: Faith_Route_Where_Are_You_FINAL
-          path: |
-            faith-route-studio/The_Question_God_Keeps_Asking_MASTER.mp4
-            faith-route-studio/thumbnail_where_are_you.jpg
+          path: final_out/*
           retention-days: 7
