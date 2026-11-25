@@ -1,0 +1,104 @@
+name: Render Faith Route Video (1080p)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg & Chrome Libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg wget
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y -qq ./google-chrome-stable_current_amd64.deb
+          rm -f google-chrome-stable_current_amd64.deb
+
+      - name: Unpack Project ZIP & Locate Audio
+        run: |
+          python3 - << 'EOF'
+          import os, glob, zipfile, shutil
+
+          if not os.path.isdir('faith-route-studio'):
+              zips = sorted(glob.glob('*.zip'))
+              assert zips, 'No .zip file found in repo root!'
+              pref = [z for z in zips if 'where_are_you' in z.lower() or 'complete' in z.lower()]
+              chosen = pref[-1] if pref else zips[-1]
+              print(f'Extracting {chosen}...')
+              with zipfile.ZipFile(chosen, 'r') as z:
+                  z.extractall('.')
+
+          assert os.path.isdir('faith-route-studio'), 'faith-route-studio folder missing after extract!'
+
+          mp3s = sorted(glob.glob('*.mp3') + glob.glob('faith-route-studio/*.mp3'))
+          assert mp3s, 'No .mp3 voiceover file found in repo root!'
+          voice_mp3 = None
+          ambient_mp3 = None
+          for f in mp3s:
+              nl = os.path.basename(f).lower()
+              if any(k in nl for k in ['ambient', 'music', 'bg']):
+                  ambient_mp3 = f
+              else:
+                  voice_mp3 = f
+          assert voice_mp3, 'Could not identify voiceover .mp3!'
+          shutil.copy(voice_mp3, 'faith-route-studio/voice_input.mp3')
+          print(f'Voiceover: {voice_mp3}')
+          if ambient_mp3:
+              shutil.copy(ambient_mp3, 'faith-route-studio/ambient_input.mp3')
+              print(f'Ambient music: {ambient_mp3}')
+          EOF
+
+      - name: Setup Faith Route Studio (NPM, Fonts & Whisper)
+        working-directory: faith-route-studio
+        run: bash tools/setup.sh
+
+      - name: Build Voice WAV, Transcribe & Align Word Timestamps
+        working-directory: faith-route-studio
+        run: |
+          bash tools/voice.sh voice_input.mp3
+          python3 tools/tr.py
+          python3 tools/align.py
+          python3 tools/chk.py app/src/scenes/ay1.tsx app/src/scenes/ay2.tsx
+
+      - name: Render 1080p Video Chunks (4 Cores)
+        working-directory: faith-route-studio
+        run: |
+          CONCURRENCY=$(nproc) bash tools/render.sh
+
+      - name: Assemble, Master Audio (-14 LUFS) & Render Thumbnail
+        working-directory: faith-route-studio
+        run: |
+          bash tools/final.sh raw_muxed.mp4
+          OUT="The_Question_God_Keeps_Asking_MASTER.mp4"
+          if [ -f "ambient_input.mp3" ]; then
+            ffmpeg -loglevel error -y -i raw_muxed.mp4 -stream_loop -1 -i ambient_input.mp3 -filter_complex "[1:a]volume=0.11[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=3,loudnorm=I=-14:TP=-1.5:LRA=11[aout]" -map 0:v -map "[aout]" -c:v copy -c:a aac -b:a 256k "$OUT"
+          else
+            ffmpeg -loglevel error -y -i raw_muxed.mp4 -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v copy -c:a aac -b:a 256k "$OUT"
+          fi
+          bash tools/thumb.sh 1 thumbnail_where_are_you.jpg
+          ls -lh "$OUT" thumbnail_where_are_you.jpg
+
+      - name: Upload Mastered MP4 & Thumbnail Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Faith_Route_Where_Are_You_FINAL
+          path: |
+            faith-route-studio/The_Question_God_Keeps_Asking_MASTER.mp4
+            faith-route-studio/thumbnail_where_are_you.jpg
+          retention-days: 7
